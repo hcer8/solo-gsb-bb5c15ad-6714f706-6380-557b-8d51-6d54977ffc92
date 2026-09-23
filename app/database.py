@@ -57,6 +57,19 @@ CREATE TABLE IF NOT EXISTS roll_expected (
     end_no   INTEGER NOT NULL,
     PRIMARY KEY (roll_no, start_no, end_no)
 );
+
+CREATE TABLE IF NOT EXISTS rescan_claims (
+    id           TEXT PRIMARY KEY,
+    roll_no      TEXT NOT NULL,
+    claimer      TEXT NOT NULL,
+    start_no     INTEGER NOT NULL,
+    end_no       INTEGER NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    expires_at   TEXT NOT NULL,
+    expire_epoch INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_claims_roll ON rescan_claims (roll_no, expire_epoch);
 """
 
 

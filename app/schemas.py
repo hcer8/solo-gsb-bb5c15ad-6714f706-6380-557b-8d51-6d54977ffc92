@@ -71,6 +71,34 @@ class RollSummary(BaseModel):
     missing_ranges: list[list[int]]
 
 
+class RescanClaimIn(BaseModel):
+    claimer: str = Field(..., min_length=1, description="领取人")
+    max_frames: int = Field(..., ge=1, description="本次最多领取的帧数（正整数）")
+    ttl_seconds: int = Field(
+        ..., ge=1, description="认领有效秒数；到期后帧段自动让出"
+    )
+
+    @field_validator("claimer")
+    @classmethod
+    def _strip_claimer(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("claimer 不能为空")
+        return v
+
+
+class RescanClaimOut(BaseModel):
+    id: str
+    roll_no: str
+    claimer: str
+    range: list[int] = Field(..., description="本次认领的连续闭区间 [start, end]")
+    created_at: str
+    expires_at: str
+    remaining_missing_ranges: list[list[int]] = Field(
+        ..., description="该任务仍缺失的帧段（已被新批次扫到的帧会从中扣除）"
+    )
+
+
 class HealthOut(BaseModel):
     status: str
     db: str

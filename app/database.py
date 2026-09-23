@@ -57,6 +57,24 @@ CREATE TABLE IF NOT EXISTS roll_expected (
     end_no   INTEGER NOT NULL,
     PRIMARY KEY (roll_no, start_no, end_no)
 );
+
+CREATE TABLE IF NOT EXISTS rescan_claims (
+    id          TEXT PRIMARY KEY,
+    roll_no     TEXT NOT NULL,
+    claimant    TEXT NOT NULL,
+    frame_start INTEGER NOT NULL,
+    frame_end   INTEGER NOT NULL,
+    max_frames  INTEGER NOT NULL,
+    ttl_seconds INTEGER NOT NULL,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    released_at TEXT,
+    CHECK (frame_end >= frame_start),
+    CHECK (max_frames  > 0),
+    CHECK (ttl_seconds > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claims_roll ON rescan_claims (roll_no);
 """
 
 

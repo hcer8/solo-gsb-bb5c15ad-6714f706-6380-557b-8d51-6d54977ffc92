@@ -1,10 +1,11 @@
-"""核心业务逻辑：批次导入、跨批次合并、缺帧区间计算。"""
+"""核心业务逻辑：批次导入、跨批次合并、缺帧区间计算、补扫任务认领。"""
 from __future__ import annotations
 
 import hashlib
 import json
 import sqlite3
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from . import schemas
 
@@ -61,6 +62,41 @@ def out_of_range_frames(
     return sorted(
         f for f in frames if not any(s <= f <= e for s, e in expected)
     )
+
+
+def subtract_intervals(
+    base: list[tuple[int, int]], cuts: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """从一组已合并闭区间 base 中扣除 cuts 覆盖的部分，返回合并后的剩余闭区间。"""
+    result: list[tuple[int, int]] = []
+    for s, e in merge_intervals(base):
+        segments = [(s, e)]
+        for cs, ce in merge_intervals(cuts):
+            next_segments: list[tuple[int, int]] = []
+            for seg_s, seg_e in segments:
+                if ce < seg_s or cs > seg_e:
+                    next_segments.append((seg_s, seg_e))
+                else:
+                    if cs > seg_s:
+                        next_segments.append((seg_s, min(seg_e, cs - 1)))
+                    if ce < seg_e:
+                        next_segments.append((max(seg_s, ce + 1), seg_e))
+            segments = next_segments
+        result.extend(segments)
+    return merge_intervals(result)
+
+
+def intersect_intervals(
+    a: list[tuple[int, int]], b: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """两组已合并闭区间的交集（合并后的连续闭区间）。"""
+    result: list[tuple[int, int]] = []
+    for as_, ae in merge_intervals(a):
+        for bs, be in merge_intervals(b):
+            s, e = max(as_, bs), min(ae, be)
+            if s <= e:
+                result.append((s, e))
+    return merge_intervals(result)
 
 
 # ---------- 数据访问 ----------
@@ -270,3 +306,157 @@ class BatchIdConflictError(Exception):
     def __init__(self, batch_id: str):
         self.batch_id = batch_id
         super().__init__(f"batch_id 已被其他内容占用: {batch_id}")
+
+
+# ---------- 补扫任务认领 ----------
+
+class RollNotFoundError(Exception):
+    pass
+
+
+class NoClaimableFramesError(Exception):
+    pass
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _roll_exists(conn: sqlite3.Connection, roll_no: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM batches WHERE roll_no = ? LIMIT 1", (roll_no,)
+        ).fetchone()
+        is not None
+    )
+
+
+_ACTIVE_CLAIMS_SQL = """
+    SELECT id, roll_no, claimant, frame_start, frame_end, max_frames,
+           ttl_seconds, created_at, expires_at, released_at
+      FROM rescan_claims
+     WHERE roll_no = ?
+       AND released_at IS NULL
+       AND expires_at > ?
+     ORDER BY frame_start, id
+"""
+
+
+def _active_claim_rows(conn: sqlite3.Connection, roll_no: str) -> list[sqlite3.Row]:
+    return conn.execute(_ACTIVE_CLAIMS_SQL, (roll_no, _now_iso())).fetchall()
+
+
+def _claim_out(conn: sqlite3.Connection, r: sqlite3.Row) -> schemas.RescanClaimOut:
+    """组装响应：认领帧段与当前缺帧区间取交，即该任务仍需补扫的帧段。"""
+    st = _state_from_db(conn, r["roll_no"])
+    remaining = intersect_intervals(
+        st["missing"], [(r["frame_start"], r["frame_end"])]
+    )
+    return schemas.RescanClaimOut(
+        id=r["id"],
+        roll_no=r["roll_no"],
+        claimant=r["claimant"],
+        frame_start=r["frame_start"],
+        frame_end=r["frame_end"],
+        frame_count=r["frame_end"] - r["frame_start"] + 1,
+        max_frames=r["max_frames"],
+        ttl_seconds=r["ttl_seconds"],
+        created_at=r["created_at"],
+        expires_at=r["expires_at"],
+        remaining_missing_ranges=[list(x) for x in remaining],
+    )
+
+
+def create_rescan_claim(
+    conn: sqlite3.Connection, data: schemas.RescanClaimIn, roll_no: str
+) -> schemas.RescanClaimOut:
+    """原子领取一段缺帧。
+
+    当前缺帧区间扣除所有未到期认领区间后，按帧号升序取首段长度不超过
+    max_frames 的连续闭区间；整个过程在 BEGIN IMMEDIATE 写事务内完成，
+    并发领取由 SQLite 写锁串行化，帧段不会交叠。
+    """
+    base = datetime.now(timezone.utc)
+    now = base.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    expires = (base + timedelta(seconds=data.ttl_seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f"
+    )[:-3] + "Z"
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not _roll_exists(conn, roll_no):
+            raise RollNotFoundError(roll_no)
+
+        st = _state_from_db(conn, roll_no)
+        claimed = [
+            (r["frame_start"], r["frame_end"])
+            for r in _active_claim_rows(conn, roll_no)
+        ]
+        available = subtract_intervals(st["missing"], claimed)
+
+        chosen: tuple[int, int] | None = None
+        for s, e in available:  # 已按帧号升序
+            if s <= e:  # subtract 已过滤空段，这里仅为类型检查友好
+                chosen = (s, min(e, s + data.max_frames - 1))
+                break
+        if chosen is None:
+            raise NoClaimableFramesError(roll_no)
+
+        claim_id = uuid.uuid4().hex
+        frame_start, frame_end = chosen
+        conn.execute(
+            """INSERT INTO rescan_claims
+                   (id, roll_no, claimant, frame_start, frame_end,
+                    max_frames, ttl_seconds, created_at, expires_at, released_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+            (
+                claim_id,
+                roll_no,
+                data.claimant,
+                frame_start,
+                frame_end,
+                data.max_frames,
+                data.ttl_seconds,
+                now,
+                expires,
+            ),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    row = conn.execute(
+        "SELECT * FROM rescan_claims WHERE id = ?", (claim_id,)
+    ).fetchone()
+    assert row is not None
+    return _claim_out(conn, row)
+
+
+def list_rescan_claims(
+    conn: sqlite3.Connection, roll_no: str
+) -> list[schemas.RescanClaimOut] | None:
+    """列出某胶卷全部未到期、未释放的认领任务。胶卷不存在返回 None。"""
+    if not _roll_exists(conn, roll_no):
+        return None
+    rows = _active_claim_rows(conn, roll_no)
+    return [_claim_out(conn, r) for r in rows]
+
+
+def release_rescan_claim(conn: sqlite3.Connection, claim_id: str) -> bool:
+    """释放（删除）认领任务；任务不存在、已释放或已到期均返回 False。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            """UPDATE rescan_claims
+                  SET released_at = ?
+                WHERE id = ?
+                  AND released_at IS NULL
+                  AND expires_at > ?""",
+            (_now_iso(), claim_id, _now_iso()),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return cur.rowcount > 0

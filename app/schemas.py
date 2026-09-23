@@ -1,7 +1,11 @@
 """Pydantic 请求/响应模型。"""
 from __future__ import annotations
 
+from typing import Annotated
+
 from pydantic import BaseModel, Field, field_validator
+
+PositiveInt = Annotated[int, Field(ge=1)]
 
 
 class BatchIn(BaseModel):
@@ -74,6 +78,36 @@ class RollSummary(BaseModel):
 class HealthOut(BaseModel):
     status: str
     db: str
+
+
+class RescanClaimIn(BaseModel):
+    claimant: str = Field(..., min_length=1, description="领取人标识")
+    max_frames: PositiveInt = Field(..., description="本次最多领取的帧数（正整数）")
+    ttl_seconds: PositiveInt = Field(..., description="认领有效秒数（正整数），到期后帧段自动让出")
+
+    @field_validator("claimant")
+    @classmethod
+    def _strip_claimant(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("claimant 不能为空")
+        return v
+
+
+class RescanClaimOut(BaseModel):
+    id: str
+    roll_no: str
+    claimant: str
+    frame_start: int = Field(..., description="认领帧段起始（含）")
+    frame_end: int = Field(..., description="认领帧段结束（含）")
+    frame_count: int
+    max_frames: int
+    ttl_seconds: int
+    created_at: str
+    expires_at: str
+    remaining_missing_ranges: list[list[int]] = Field(
+        ..., description="该任务帧段中目前仍缺失（未扫到）的连续闭区间"
+    )
 
 
 RollState.model_rebuild()

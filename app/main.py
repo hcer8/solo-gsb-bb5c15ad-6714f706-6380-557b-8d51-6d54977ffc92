@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等。",
-    version="1.0.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持补扫任务认领。",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -75,6 +75,59 @@ def get_roll(roll_no: str, conn: Connection = Depends(database.get_db)):
     if result is None:
         raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
     return result
+
+
+@app.post(
+    "/rolls/{roll_no}/rescan-claims",
+    response_model=schemas.RescanClaimOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["补扫认领"],
+)
+def create_rescan_claim(
+    roll_no: str,
+    payload: schemas.RescanClaimIn,
+    conn: Connection = Depends(database.get_db),
+):
+    """认领一段缺帧用于补扫。
+
+    当前缺帧区间扣除所有未到期认领后，按帧号升序分配首段不超过
+    ``max_frames`` 的连续闭区间。胶卷不存在返回 404，暂无可领取帧返回 409。
+    """
+    try:
+        return services.create_rescan_claim(conn, payload, roll_no.strip())
+    except services.RollNotFoundError:
+        raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
+    except services.NoClaimableFramesError:
+        raise HTTPException(status_code=409, detail="当前没有可领取的缺帧（可能已被其他未到期任务认领）")
+
+
+@app.get(
+    "/rolls/{roll_no}/rescan-claims",
+    response_model=list[schemas.RescanClaimOut],
+    tags=["补扫认领"],
+)
+def list_rescan_claims(
+    roll_no: str, conn: Connection = Depends(database.get_db)
+):
+    """列出该胶卷全部未到期的补扫认领任务，及其帧段内仍缺失的帧段。"""
+    result = services.list_rescan_claims(conn, roll_no.strip())
+    if result is None:
+        raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
+    return result
+
+
+@app.delete(
+    "/rescan-claims/{claim_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["补扫认领"],
+)
+def release_rescan_claim(
+    claim_id: str, conn: Connection = Depends(database.get_db)
+):
+    """释放（删除）一个补扫认领任务；任务不存在、已释放或已到期返回 404。"""
+    if not services.release_rescan_claim(conn, claim_id.strip()):
+        raise HTTPException(status_code=404, detail="补扫任务不存在、已释放或已到期")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 if __name__ == "__main__":
